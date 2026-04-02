@@ -28,10 +28,14 @@ function App() {
     const requestRef = useRef(null);
     const synthRef = useRef(null);
     const fileInputRef = useRef(null);
+    const blobUrlRef = useRef(null);
 
     useEffect(() => {
         synthRef.current = new Tone.PolySynth(Tone.Synth).toDestination();
-        return () => synthRef.current?.dispose();
+        return () => {
+            synthRef.current?.dispose();
+            if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
+        };
     }, []);
 
     const playSound = (type) => {
@@ -144,7 +148,9 @@ function App() {
     const handleFileUpload = (e) => {
         const file = e.target.files[0];
         if (file) {
+            if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current);
             const url = URL.createObjectURL(file);
+            blobUrlRef.current = url;
             setVideoUrl(url);
             handleStart(url);
         }
@@ -228,34 +234,37 @@ function App() {
         setIsWon(false);
     }, []);
 
-    const handleMouseDown = (e) => {
-        if (!isPlaying || isWon || showHint) return;
+    const getPointerPos = (e) => {
         const rect = containerRef.current.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        const c = Math.floor((x / rect.width) * gridSize);
-        const r = Math.floor((y / rect.height) * gridSize);
+        const touch = e.touches ? e.touches[0] || e.changedTouches[0] : e;
+        return { x: touch.clientX - rect.left, y: touch.clientY - rect.top };
+    };
+
+    const handlePointerDown = useCallback((e) => {
+        if (!isPlaying || isWon || showHint) return;
+        e.preventDefault();
+        const { x, y } = getPointerPos(e);
+        const c = Math.floor((x / containerRef.current.getBoundingClientRect().width) * gridSize);
+        const r = Math.floor((y / containerRef.current.getBoundingClientRect().height) * gridSize);
         const tile = tiles.find(t => t.currentR === r && t.currentC === c);
         if (tile) {
             const group = getTileGroup(tile, tiles);
             setDraggedGroup(group);
             setMousePos({ x, y });
         }
-    };
+    }, [isPlaying, isWon, showHint, gridSize, tiles, getTileGroup]);
 
-    const handleMouseMove = (e) => {
+    const handlePointerMove = useCallback((e) => {
         if (!draggedGroup || !containerRef.current) return;
-        const rect = containerRef.current.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        setMousePos({ x, y });
-    };
+        e.preventDefault();
+        setMousePos(getPointerPos(e));
+    }, [draggedGroup]);
 
-    const handleMouseUp = (e) => {
+    const handlePointerUp = useCallback((e) => {
         if (!draggedGroup) return;
+        e.preventDefault();
         const rect = containerRef.current.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
+        const { x, y } = getPointerPos(e);
         const pivot = draggedGroup[0];
         const targetC = Math.floor((x / rect.width) * gridSize);
         const targetR = Math.floor((y / rect.height) * gridSize);
@@ -276,110 +285,178 @@ function App() {
             const nonDraggedTiles = tiles.filter(t => !draggedKeys.has(`${t.r},${t.c}`));
             const allLockedGroups = getLockedSubgroups(nonDraggedTiles);
 
+            // Cascading displacement: displaced clusters can land anywhere
+            // on the grid, displacing further clusters as needed.
             const touchedGroups = allLockedGroups.filter(group =>
                 group.some(t => groupNewPositions.has(`${t.currentR},${t.currentC}`))
             );
 
-            const invalidPartialGroup = touchedGroups.find(group =>
-                group.some(t => groupNewPositions.has(`${t.currentR},${t.currentC}`)) &&
-                !group.every(t => groupNewPositions.has(`${t.currentR},${t.currentC}`))
-            );
+            // Map each board cell to its cluster (for untouched tiles only)
+            const boardCellMap = new Map();
+            allLockedGroups.forEach(group => {
+                if (!touchedGroups.includes(group)) {
+                    group.forEach(t => boardCellMap.set(`${t.currentR},${t.currentC}`, group));
+                }
+            });
 
-            if (invalidPartialGroup) {
-                flashInvalidDrop(invalidPartialGroup.map(t => ({ r: t.currentR, c: t.currentC })));
-                setDraggedGroup(null);
-                return;
-            }
+            // Dragged group's new cells are permanently occupied
+            const fixedCells = new Set(groupNewPositions);
+            // Cells claimed by successfully placed displaced clusters
+            const placedCells = new Set();
 
-            const displacedTiles = touchedGroups.flat();
-            let availableVacatedCoords = Array.from(groupOldPositions)
-                .filter(k => !groupNewPositions.has(k))
-                .map(k => {
-                    const [r, c] = k.split(',').map(Number);
-                    return { r, c };
-                });
-
+            const needsPlacement = [...touchedGroups];
             const reassignment = new Map();
-            let moveIsValid = true;
+            let failedGroup = null;
 
-            touchedGroups
-                .sort((a, b) => b.length - a.length)
-                .forEach(group => {
-                    if (!moveIsValid) return;
+            // Remove initially displaced clusters from the board
+            touchedGroups.forEach(group => {
+                group.forEach(t => boardCellMap.delete(`${t.currentR},${t.currentC}`));
+            });
 
-                    const baseR = Math.min(...group.map(t => t.currentR));
-                    const baseC = Math.min(...group.map(t => t.currentC));
-                    const normalizedShape = group.map(t => ({
-                        tile: t,
-                        dr: t.currentR - baseR,
-                        dc: t.currentC - baseC
-                    }));
+            const maxIterations = gridSize * gridSize;
+            let iterations = 0;
 
-                    const candidateAnchors = sortCoords(availableVacatedCoords);
-                    let placed = false;
+            while (needsPlacement.length > 0) {
+                if (++iterations > maxIterations) {
+                    failedGroup = needsPlacement[0];
+                    break;
+                }
 
-                    for (const anchor of candidateAnchors) {
-                        const targetCoords = normalizedShape.map(part => ({
-                            r: anchor.r + part.dr,
-                            c: anchor.c + part.dc
+                // Place largest clusters first (fewest valid positions)
+                needsPlacement.sort((a, b) => b.length - a.length);
+                const cluster = needsPlacement.shift();
+
+                const baseR = Math.min(...cluster.map(t => t.currentR));
+                const baseC = Math.min(...cluster.map(t => t.currentC));
+                const shape = cluster.map(t => ({
+                    tile: t,
+                    dr: t.currentR - baseR,
+                    dc: t.currentC - baseC
+                }));
+                const maxDR = Math.max(...shape.map(s => s.dr));
+                const maxDC = Math.max(...shape.map(s => s.dc));
+
+                let bestPlacement = null;
+                let bestCascadeSize = Infinity;
+
+                for (let r = 0; r <= gridSize - 1 - maxDR; r++) {
+                    for (let c = 0; c <= gridSize - 1 - maxDC; c++) {
+                        const targetCoords = shape.map(part => ({
+                            r: r + part.dr,
+                            c: c + part.dc
                         }));
 
-                        const fits = targetCoords.every(coord => (
-                            availableVacatedCoords.some(v => v.r === coord.r && v.c === coord.c)
-                        ));
+                        // Cannot overlap dragged group or already-placed clusters
+                        if (targetCoords.some(coord =>
+                            fixedCells.has(`${coord.r},${coord.c}`) ||
+                            placedCells.has(`${coord.r},${coord.c}`)
+                        )) continue;
 
-                        if (fits) {
-                            normalizedShape.forEach((part, index) => {
-                                reassignment.set(`${part.tile.r},${part.tile.c}`, targetCoords[index]);
-                            });
-                            availableVacatedCoords = availableVacatedCoords.filter(v => (
-                                !targetCoords.some(tc => tc.r === v.r && tc.c === v.c)
-                            ));
-                            placed = true;
-                            break;
+                        // Find board clusters this placement would cascade
+                        const cascadeSet = new Set();
+                        for (const coord of targetCoords) {
+                            const hit = boardCellMap.get(`${coord.r},${coord.c}`);
+                            if (hit) cascadeSet.add(hit);
+                        }
+
+                        const cascadeSize = [...cascadeSet].reduce((sum, g) => sum + g.length, 0);
+                        if (cascadeSize < bestCascadeSize) {
+                            bestCascadeSize = cascadeSize;
+                            bestPlacement = { targetCoords, cascadeClusters: [...cascadeSet] };
+                            if (cascadeSize === 0) break; // perfect fit
                         }
                     }
+                    if (bestPlacement && bestCascadeSize === 0) break;
+                }
 
-                    if (!placed) {
-                        moveIsValid = false;
-                    }
+                if (!bestPlacement) {
+                    failedGroup = cluster;
+                    break;
+                }
+
+                // Commit this placement
+                shape.forEach((part, index) => {
+                    reassignment.set(`${part.tile.r},${part.tile.c}`, bestPlacement.targetCoords[index]);
                 });
+                bestPlacement.targetCoords.forEach(coord =>
+                    placedCells.add(`${coord.r},${coord.c}`)
+                );
 
-            if (!moveIsValid) {
-                flashInvalidDrop(Array.from(groupNewPositions).map(k => {
-                    const [r, c] = k.split(',').map(Number);
-                    return { r, c };
-                }));
+                // Cascade: remove overlapped board clusters and queue them
+                for (const cascaded of bestPlacement.cascadeClusters) {
+                    cascaded.forEach(t => boardCellMap.delete(`${t.currentR},${t.currentC}`));
+                    needsPlacement.push(cascaded);
+                }
+            }
+
+            if (failedGroup) {
+                flashInvalidDrop(failedGroup.map(t => ({ r: t.currentR, c: t.currentC })));
                 setDraggedGroup(null);
                 return;
             }
 
-            const displacedKeys = new Set(displacedTiles.map(t => `${t.r},${t.c}`));
             const newTiles = tiles.map(t => {
                 const tileKey = `${t.r},${t.c}`;
                 if (draggedKeys.has(tileKey)) {
                     return { ...t, currentR: t.currentR + dr, currentC: t.currentC + dc };
                 }
-
-                if (displacedKeys.has(tileKey)) {
-                    const reassignedSpot = reassignment.get(tileKey);
-                    if (reassignedSpot) {
-                        return { ...t, currentR: reassignedSpot.r, currentC: reassignedSpot.c };
-                    }
+                const reassignedSpot = reassignment.get(tileKey);
+                if (reassignedSpot) {
+                    return { ...t, currentR: reassignedSpot.r, currentC: reassignedSpot.c };
                 }
-
                 return t;
             });
             
-            setTiles(newTiles);
-            playSound('move');
-            if (newTiles.every(t => t.r === t.currentR && t.c === t.currentC)) {
+            const allHome = newTiles.every(t => t.r === t.currentR && t.c === t.currentC);
+            if (allHome && reassignment.size === 0) {
+                // Player placed the final piece — legitimate win
+                setTiles(newTiles);
                 setIsWon(true);
                 playSound('win');
+            } else if (allHome && reassignment.size > 0) {
+                // Displacement accidentally solved the puzzle — reshuffle
+                // displaced tiles by rotating their positions so none stay home
+                const displacedKeys = [...reassignment.keys()];
+                const homePositions = displacedKeys.map(key => {
+                    const t = newTiles.find(t => `${t.r},${t.c}` === key);
+                    return { r: t.currentR, c: t.currentC };
+                });
+                // Rotate by 1: each displaced tile gets the next one's position
+                const rotated = [...homePositions.slice(1), homePositions[0]];
+                const reshuffled = newTiles.map(t => {
+                    const idx = displacedKeys.indexOf(`${t.r},${t.c}`);
+                    if (idx !== -1) {
+                        return { ...t, currentR: rotated[idx].r, currentC: rotated[idx].c };
+                    }
+                    return t;
+                });
+                setTiles(reshuffled);
+                playSound('move');
+            } else {
+                setTiles(newTiles);
+                const anyLocked = newTiles.some(t => {
+                    if (!draggedKeys.has(`${t.r},${t.c}`)) return false;
+                    return t.r === t.currentR && t.c === t.currentC;
+                });
+                playSound(anyLocked ? 'lock' : 'move');
             }
         }
         setDraggedGroup(null);
-    };
+    }, [draggedGroup, gridSize, tiles, getLockedSubgroups, flashInvalidDrop, playSound]);
+
+    useEffect(() => {
+        const container = containerRef.current;
+        const root = document.getElementById('root-inner');
+        if (!container || !root) return;
+        container.addEventListener('touchstart', handlePointerDown, { passive: false });
+        root.addEventListener('touchmove', handlePointerMove, { passive: false });
+        root.addEventListener('touchend', handlePointerUp, { passive: false });
+        return () => {
+            container.removeEventListener('touchstart', handlePointerDown);
+            root.removeEventListener('touchmove', handlePointerMove);
+            root.removeEventListener('touchend', handlePointerUp);
+        };
+    }, [handlePointerDown, handlePointerMove, handlePointerUp]);
 
     const resetPuzzle = () => {
         setIsPlaying(false);
@@ -414,12 +491,20 @@ function App() {
             drawH = v.videoWidth / canvasAspect;
             offsetY = (v.videoHeight - drawH) / 2;
         }
+
+        ctx.clearRect(0, 0, c.width, c.height);
+
+        if (showHint) {
+            ctx.drawImage(v, offsetX, offsetY, drawW, drawH, 0, 0, c.width, c.height);
+            requestRef.current = requestAnimationFrame(renderFrame);
+            return;
+        }
+
         const tileW = c.width / gridSize;
         const tileH = c.height / gridSize;
         const sourceTileW = drawW / gridSize;
         const sourceTileH = drawH / gridSize;
 
-        ctx.clearRect(0, 0, c.width, c.height);
         tiles.forEach(tile => {
             if (draggedGroup && draggedGroup.some(gt => gt.r === tile.r && gt.c === tile.c)) return;
             ctx.drawImage(v, offsetX + tile.c * sourceTileW, offsetY + tile.r * sourceTileH, sourceTileW, sourceTileH, tile.currentC * tileW, tile.currentR * tileH, tileW, tileH);
@@ -461,7 +546,7 @@ function App() {
             ctx.restore();
         }
         requestRef.current = requestAnimationFrame(renderFrame);
-    }, [isPlaying, isWon, gridSize, tiles, draggedGroup, mousePos, invalidDropCells]);
+    }, [isPlaying, isWon, gridSize, tiles, draggedGroup, mousePos, invalidDropCells, showHint]);
 
     useEffect(() => {
         if (isPlaying) requestRef.current = requestAnimationFrame(renderFrame);
@@ -469,29 +554,31 @@ function App() {
     }, [isPlaying, renderFrame]);
 
     return html`
-        <div className="min-h-screen p-4 md:p-8 flex flex-col items-center justify-center bg-[#0f172a] text-slate-100 font-sans" onMouseMove=${handleMouseMove} onMouseUp=${handleMouseUp}>
-            <header className="mb-8 text-center max-w-2xl">
-                <h1 className="text-4xl font-black mb-2 bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">LIVE VIDEO PUZZLE</h1>
-                <p className="text-slate-400">Drag video clusters to swap their positions and solve the puzzle.</p>
-            </header>
-            <main className="w-full max-w-6xl grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
-                <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-700 shadow-xl space-y-6">
-                    <div>
-                        <label className="block text-sm font-medium text-slate-300 mb-2">Direct Video URL</label>
-                        <input type="text" placeholder="https://example.com/video.mp4" className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 outline-none text-slate-100 placeholder:text-slate-600 transition-all" value=${videoUrl} onChange=${(e) => setVideoUrl(e.target.value)} />
-                        <button onClick=${() => setVideoUrl(DEFAULT_VIDEO)} className="mt-2 text-xs text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1"><${Info} size=${12} /> Use Sample Video</button>
-                    </div>
-                    <div>
-                        <div className="flex justify-between mb-2">
-                            <label className="text-sm font-medium text-slate-300">Grid Size: ${gridSize}x${gridSize}</label>
-                            <span className="text-xs text-slate-500">${gridSize * gridSize} tiles</span>
+        <div id="root-inner" className="min-h-screen p-4 md:p-8 flex flex-col items-center justify-center bg-[#0f172a] text-slate-100 font-sans" onMouseMove=${handlePointerMove} onMouseUp=${handlePointerUp}>
+            ${!isPlaying && html`
+                <header className="mb-8 text-center max-w-2xl">
+                    <h1 className="text-4xl font-black mb-2 bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">LIVE VIDEO PUZZLE</h1>
+                    <p className="text-slate-400">Drag video clusters to swap their positions and solve the puzzle.</p>
+                </header>
+            `}
+            <main className="w-full max-w-6xl ${isPlaying ? '' : 'grid grid-cols-1 lg:grid-cols-3 gap-8'} items-start">
+                ${!isPlaying && html`
+                    <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-700 shadow-xl space-y-6">
+                        <div>
+                            <label className="block text-sm font-medium text-slate-300 mb-2">Direct Video URL</label>
+                            <input type="text" placeholder="https://example.com/video.mp4" className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 focus:ring-2 focus:ring-blue-500 outline-none text-slate-100 placeholder:text-slate-600 transition-all" value=${videoUrl} onChange=${(e) => setVideoUrl(e.target.value)} />
+                            <button onClick=${() => setVideoUrl(DEFAULT_VIDEO)} className="mt-2 text-xs text-blue-400 hover:text-blue-300 transition-colors flex items-center gap-1"><${Info} size=${12} /> Use Sample Video</button>
                         </div>
-                        <input type="range" min="2" max="20" value=${gridSize} onChange=${(e) => setGridSize(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" />
-                    </div>
-                    <div className="flex flex-col gap-3">
-                        <input type="file" ref=${fileInputRef} onChange=${handleFileUpload} accept="video/*" className="hidden" />
-                        <div className="grid grid-cols-2 gap-3">
-                            ${!isPlaying ? html`
+                        <div>
+                            <div className="flex justify-between mb-2">
+                                <label className="text-sm font-medium text-slate-300">Grid Size: ${gridSize}x${gridSize}</label>
+                                <span className="text-xs text-slate-500">${gridSize * gridSize} tiles</span>
+                            </div>
+                            <input type="range" min="2" max="20" value=${gridSize} onChange=${(e) => setGridSize(parseInt(e.target.value))} className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer" />
+                        </div>
+                        <div className="flex flex-col gap-3">
+                            <input type="file" ref=${fileInputRef} onChange=${handleFileUpload} accept="video/*" className="hidden" />
+                            <div className="grid grid-cols-2 gap-3">
                                 <button id="start-puzzle-btn" onClick=${() => handleStart()} disabled=${status === 'loading' || isFetching} className="col-span-1 py-3 bg-blue-600 hover:bg-blue-500 active:bg-blue-700 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-500/20 disabled:opacity-50">
                                     ${status === 'loading' ? 'Loading...' : html`<${Play} size=${20} /> Start`}
                                 </button>
@@ -501,35 +588,34 @@ function App() {
                                 <button onClick=${fetchRandomVideo} disabled=${status === 'loading' || isFetching} className="col-span-2 py-3 bg-indigo-600 hover:bg-indigo-500 active:bg-indigo-700 rounded-xl font-bold flex items-center justify-center gap-2 transition-all shadow-lg shadow-indigo-500/20 disabled:opacity-50">
                                     ${isFetching ? 'Searching...' : html`Random Video`}
                                 </button>
-                            ` : html`
-                                <button onClick=${resetPuzzle} className="col-span-1 py-3 bg-slate-700 hover:bg-slate-600 rounded-xl font-bold flex items-center justify-center gap-2 transition-all border border-slate-600">
-                                    <${RotateCcw} size=${20} /> Reset
-                                </button>
-                                <button onClick=${() => setIsMuted(!isMuted)} className="col-span-1 py-3 bg-slate-700 hover:bg-slate-600 rounded-xl font-bold flex items-center justify-center gap-2 transition-all border border-slate-600">
-                                    ${isMuted ? html`<${VolumeX} size=${20} /> Unmute` : html`<${Volume2} size=${20} /> Mute`}
-                                </button>
-                            `}
+                            </div>
                         </div>
-                        ${isPlaying && !isWon && html`
-                            <button onMouseDown=${() => setShowHint(true)} onMouseUp=${() => setShowHint(false)} onMouseLeave=${() => setShowHint(false)} onTouchStart=${() => setShowHint(true)} onTouchEnd=${() => setShowHint(false)} className="w-full py-3 bg-slate-800/80 hover:bg-slate-700 rounded-xl font-bold flex items-center justify-center gap-2 transition-all border border-slate-700">
-                                <${Maximize} size=${18} /> Hold to Peek Original
+                        <div className="bg-blue-500/10 p-4 rounded-xl border border-blue-500/20">
+                            <p className="text-xs text-blue-300 leading-relaxed"><span className="font-bold">Tip:</span> Tiles that belong together will lock into clusters. Dragging a cluster moves the entire group!</p>
+                        </div>
+                        ${error && html`<div className="p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex gap-3"><${AlertTriangle} className="text-red-500 shrink-0" size=${20} /><p className="text-xs text-red-400 leading-relaxed">${error}</p></div>`}
+                    </div>
+                `}
+                <div className="${isPlaying ? 'w-full' : 'lg:col-span-2'} relative">
+                    ${isPlaying && !isWon && html`
+                        <div className="absolute top-3 right-3 z-10 flex gap-2">
+                            <button onMouseDown=${() => setShowHint(true)} onMouseUp=${() => setShowHint(false)} onMouseLeave=${() => setShowHint(false)} onTouchStart=${() => setShowHint(true)} onTouchEnd=${() => setShowHint(false)} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title="Hold to Peek">
+                                <${Maximize} size=${18} />
                             </button>
-                        `}
-                    </div>
-                    <div className="bg-blue-500/10 p-4 rounded-xl border border-blue-500/20">
-                        <p className="text-xs text-blue-300 leading-relaxed"><span className="font-bold">Tip:</span> Tiles that belong together will lock into clusters. Dragging a cluster moves the entire group!</p>
-                    </div>
-                    ${error && html`<div className="p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex gap-3"><${AlertTriangle} className="text-red-500 shrink-0" size=${20} /><p className="text-xs text-red-400 leading-relaxed">${error}</p></div>`}
-                </div>
-                <div className="lg:col-span-2 relative">
-                    <div ref=${containerRef} className="aspect-video bg-slate-900 rounded-2xl overflow-hidden border border-slate-700 shadow-2xl relative select-none" style=${{ cursor: isPlaying && !isWon ? (draggedGroup ? 'grabbing' : 'grab') : 'default' }} onMouseDown=${handleMouseDown}>
+                            <button onClick=${() => setIsMuted(!isMuted)} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title=${isMuted ? 'Unmute' : 'Mute'}>
+                                ${isMuted ? html`<${VolumeX} size=${18} />` : html`<${Volume2} size=${18} />`}
+                            </button>
+                            <button onClick=${resetPuzzle} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title="Settings">
+                                <${Settings} size=${18} />
+                            </button>
+                        </div>
+                    `}
+                    <div ref=${containerRef} className="aspect-video bg-slate-900 rounded-2xl overflow-hidden border border-slate-700 shadow-2xl relative select-none" style=${{ cursor: isPlaying && !isWon ? (draggedGroup ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }} onMouseDown=${handlePointerDown}>
                         ${!isPlaying && status === 'idle' && html`<div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600"><${Maximize} size=${48} strokeWidth=${1} className="mb-4 opacity-20" /><p>Enter a URL and click Start</p></div>`}
-                        <canvas ref=${canvasRef} width="1280" height="720" className="w-full h-full block" style=${{ display: isPlaying && !showHint ? 'block' : 'none' }} />
-                        ${isPlaying && showHint && !isWon && videoRef.current && videoRef.current.src && html`<video src=${videoRef.current.src} autoPlay loop muted playsInline className="w-full h-full object-cover" />`}
+                        <canvas ref=${canvasRef} width="1280" height="720" className="w-full h-full block" style=${{ display: isPlaying ? 'block' : 'none' }} />
                         ${isWon && html`<div className="absolute inset-0 bg-emerald-500/20 backdrop-blur-sm flex flex-col items-center justify-center transition-all duration-500"><${CheckCircle2} size=${64} className="text-emerald-400 mb-4 animate-bounce" /><h2 className="text-4xl font-black text-white drop-shadow-lg">PUZZLE SOLVED!</h2><button onClick=${() => initPuzzle(gridSize)} className="mt-6 px-8 py-3 bg-white text-emerald-600 rounded-full font-bold hover:scale-105 transition-transform shadow-xl">Play Again</button></div>`}
                     </div>
                     <video ref=${videoRef} loop playsInline className="hidden" />
-                    ${isPlaying && !isWon && html`<div className="mt-4 flex justify-between items-center text-xs text-slate-500 font-mono"><span className="bg-slate-800 px-2 py-1 rounded uppercase">Mode: Magnetic Clusters</span><span className="bg-slate-800 px-2 py-1 rounded uppercase">Status: Live Rendering</span></div>`}
                 </div>
             </main>
         </div>
