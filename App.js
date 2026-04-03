@@ -20,6 +20,10 @@ import { fetchRandomVideoUrl, validateVideoUrl } from './video-source.js';
 
 const html = htm.bind(React.createElement);
 
+function isSolvedBoard(tiles) {
+    return tiles.length > 0 && tiles.every((tile) => tile.r === tile.currentR && tile.c === tile.currentC);
+}
+
 function getPointerPos(container, event) {
     const rect = container.getBoundingClientRect();
     const touch = event.touches ? event.touches[0] || event.changedTouches[0] : event;
@@ -209,11 +213,14 @@ function App() {
         }
 
         if (result.status === 'success') {
+            const solved = isSolvedBoard(result.tiles);
             setTiles(result.tiles);
-            if (result.outcome === 'win') {
+            if (solved) {
                 setIsWon(true);
+                audioRef.current?.play('win');
+            } else {
+                audioRef.current?.play(result.outcome);
             }
-            audioRef.current?.play(result.outcome);
         }
 
         setDraggedGroup(null);
