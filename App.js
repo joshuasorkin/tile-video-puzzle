@@ -4,8 +4,10 @@ import htm from 'htm';
 import {
     AlertTriangle,
     CheckCircle2,
+    Eye,
     Info,
     Maximize,
+    Minimize,
     Play,
     Settings,
     Upload,
@@ -60,7 +62,16 @@ function App() {
     const fileInputRef = useRef(null);
     const frameRequestRef = useRef(null);
     const invalidDropTimeoutRef = useRef(null);
+    const rootRef = useRef(null);
     const videoRef = useRef(null);
+
+    const [isFullscreen, setIsFullscreen] = useState(false);
+
+    useEffect(() => {
+        const onChange = () => setIsFullscreen(!!document.fullscreenElement);
+        document.addEventListener('fullscreenchange', onChange);
+        return () => document.removeEventListener('fullscreenchange', onChange);
+    }, []);
 
     useEffect(() => {
         audioRef.current = createAudioController();
@@ -109,6 +120,12 @@ function App() {
             setTiles(createShuffledTiles(gridSize));
             setIsPlaying(true);
             setStatus('playing');
+
+            // Request fullscreen on mobile for more puzzle space
+            const el = rootRef.current;
+            if (el?.requestFullscreen && !document.fullscreenElement) {
+                el.requestFullscreen().catch(() => {});
+            }
         } catch (err) {
             console.error(err);
             setError('Failed to load video. Ensure the URL is correct and supports CORS.');
@@ -171,6 +188,10 @@ function App() {
         }
 
         cancelAnimationFrame(frameRequestRef.current);
+
+        if (document.fullscreenElement) {
+            document.exitFullscreen().catch(() => {});
+        }
     }, []);
 
     const handlePointerDown = useCallback((event) => {
@@ -283,14 +304,14 @@ function App() {
     }, [draggedGroup, gridSize, invalidDropCells, isPlaying, mousePos, showHint, tiles]);
 
     return html`
-        <div id="root-inner" className="min-h-screen p-4 md:p-8 flex flex-col items-center justify-center bg-[#0f172a] text-slate-100 font-sans" onMouseMove=${handlePointerMove} onMouseUp=${handlePointerUp}>
+        <div ref=${rootRef} id="root-inner" className="${isPlaying ? 'h-[100dvh] p-2 overflow-hidden' : 'min-h-screen p-4 md:p-8'} flex flex-col items-center justify-center bg-[#0f172a] text-slate-100 font-sans" onMouseMove=${handlePointerMove} onMouseUp=${handlePointerUp}>
             ${!isPlaying && html`
                 <header className="mb-8 text-center max-w-2xl">
                     <h1 className="text-4xl font-black mb-2 bg-gradient-to-r from-blue-400 to-indigo-500 bg-clip-text text-transparent">LIVE VIDEO PUZZLE</h1>
                     <p className="text-slate-400">Drag video clusters to swap their positions and solve the puzzle.</p>
                 </header>
             `}
-            <main className="w-full max-w-6xl ${isPlaying ? '' : 'grid grid-cols-1 lg:grid-cols-3 gap-8'} items-start">
+            <main className="w-full ${isPlaying ? 'h-full' : 'max-w-6xl grid grid-cols-1 lg:grid-cols-3 gap-8'} items-start">
                 ${!isPlaying && html`
                     <div className="bg-slate-800/50 p-6 rounded-2xl border border-slate-700 shadow-xl space-y-6">
                         <div>
@@ -325,21 +346,24 @@ function App() {
                         ${error && html`<div className="p-4 bg-red-500/10 border border-red-500/20 rounded-lg flex gap-3"><${AlertTriangle} className="text-red-500 shrink-0" size=${20} /><p className="text-xs text-red-400 leading-relaxed">${error}</p></div>`}
                     </div>
                 `}
-                <div className="${isPlaying ? 'w-full' : 'lg:col-span-2'} relative">
+                <div className="${isPlaying ? 'w-full h-full flex items-center justify-center' : 'lg:col-span-2'} relative">
                     ${isPlaying && !isWon && html`
                         <div className="absolute top-3 right-3 z-10 flex gap-2">
                             <button onMouseDown=${() => setShowHint(true)} onMouseUp=${() => setShowHint(false)} onMouseLeave=${() => setShowHint(false)} onTouchStart=${() => setShowHint(true)} onTouchEnd=${() => setShowHint(false)} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title="Hold to Peek">
-                                <${Maximize} size=${18} />
+                                <${Eye} size=${18} />
                             </button>
                             <button onClick=${() => setIsMuted(!isMuted)} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title=${isMuted ? 'Unmute' : 'Mute'}>
                                 ${isMuted ? html`<${VolumeX} size=${18} />` : html`<${Volume2} size=${18} />`}
+                            </button>
+                            <button onClick=${() => { const el = rootRef.current; if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); } else if (el?.requestFullscreen) { el.requestFullscreen().catch(() => {}); } }} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title=${isFullscreen ? 'Exit Fullscreen' : 'Fullscreen'}>
+                                ${isFullscreen ? html`<${Minimize} size=${18} />` : html`<${Maximize} size=${18} />`}
                             </button>
                             <button onClick=${resetPuzzle} className="p-2 bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-600 transition-all" title="Settings">
                                 <${Settings} size=${18} />
                             </button>
                         </div>
                     `}
-                    <div ref=${containerRef} className="aspect-video bg-slate-900 rounded-2xl overflow-hidden border border-slate-700 shadow-2xl relative select-none" style=${{ cursor: isPlaying && !isWon ? (draggedGroup ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }} onMouseDown=${handlePointerDown}>
+                    <div ref=${containerRef} className="aspect-video ${isPlaying ? 'max-h-full w-auto' : ''} bg-slate-900 rounded-2xl overflow-hidden border border-slate-700 shadow-2xl relative select-none" style=${{ cursor: isPlaying && !isWon ? (draggedGroup ? 'grabbing' : 'grab') : 'default', touchAction: 'none' }} onMouseDown=${handlePointerDown}>
                         ${!isPlaying && status === 'idle' && html`<div className="absolute inset-0 flex flex-col items-center justify-center text-slate-600"><${Maximize} size=${48} strokeWidth=${1} className="mb-4 opacity-20" /><p>Enter a URL and click Start</p></div>`}
                         <canvas ref=${canvasRef} width="1280" height="720" className="w-full h-full block" style=${{ display: isPlaying ? 'block' : 'none' }} />
                         ${isWon && html`<div className="absolute inset-0 bg-emerald-500/20 backdrop-blur-sm flex flex-col items-center justify-center transition-all duration-500"><${CheckCircle2} size=${64} className="text-emerald-400 mb-4 animate-bounce" /><h2 className="text-4xl font-black text-white drop-shadow-lg">PUZZLE SOLVED!</h2><button onClick=${() => { setTiles(createShuffledTiles(gridSize)); setIsWon(false); }} className="mt-6 px-8 py-3 bg-white text-emerald-600 rounded-full font-bold hover:scale-105 transition-transform shadow-xl">Play Again</button></div>`}
